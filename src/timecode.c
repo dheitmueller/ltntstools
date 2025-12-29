@@ -53,6 +53,12 @@ void obe_timecode_reset(struct timecode_context_s *ctx)
     ctx->updateCount = 0;
 }
 
+void obe_timecode_reset_after_discontinuity(struct timecode_context_s *ctx)
+{
+    ctx->curr.corrected_frame = ctx->curr.frame;
+    ctx->prev.corrected_frame = ctx->intendedFPS - 1;
+}
+
 void obe_timecode_clear(struct timecode_context_s *ctx, uint32_t intendedFPS)
 {
     memset(ctx, 0, sizeof(*ctx));
@@ -199,8 +205,13 @@ void obe_timecode_update(struct timecode_context_s *ctx, unsigned int hrs, unsig
      * I'm totally OK with that given the bug I'm trying to catch
      * in some other system I'm currently monitoring.
      */
-    if (discontinuity || secondaryDiscontinuity) {
-        obe_timecode_raise_discontinuity(ctx);
+    if (secondaryDiscontinuity) {
+        obe_timecode_raise_discontinuity(ctx, 2);
+        obe_timecode_reset_after_discontinuity(ctx);
+    } else
+    if (discontinuity) {
+        obe_timecode_raise_discontinuity(ctx, 1);
+        obe_timecode_reset_after_discontinuity(ctx);
     } else {
         obe_timecode_clear_discontinuity(ctx);
     }
