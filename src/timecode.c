@@ -87,11 +87,24 @@ static void obe_timecode_clear_discontinuity(struct timecode_context_s *ctx)
 
 void obe_timecode_update(struct timecode_context_s *ctx, unsigned int hrs, unsigned int mins, unsigned int secs, unsigned int frame)
 {
+#if LOCAL_DEBUG
+    printf(MESSAGE_PREFIX "%s(%d, %d, %d, %d)\n", __func__,
+        hrs, mins, secs, frame);
+#endif
+
     ctx->updateCount++;
 
     int discontinuity = 1; /* assume there is a time discontinuity */
     int secondaryDiscontinuity = 1; /* assume there is a time discontinuity */
 
+#if LOCAL_DEBUG
+printf(MESSAGE_PREFIX "ctx->prev.corrected_frame %d ctx->curr.corrected_frame %d ctx->intendedFPS %d, ctx->prev.frame %d, ctx->curr.frame %d\n",
+    ctx->prev.corrected_frame,
+    ctx->curr.corrected_frame,
+    ctx->intendedFPS,
+    ctx->prev.frame,
+    ctx->curr.frame);
+#endif
     memcpy(&ctx->prev, &ctx->curr, sizeof(ctx->curr));
     ctx->curr.hours = hrs;
     ctx->curr.minutes = mins;
@@ -134,6 +147,9 @@ void obe_timecode_update(struct timecode_context_s *ctx, unsigned int hrs, unsig
     /* We'll flag a discontinuity with a major time distortion */
     int32_t t2 = (ctx->curr.hours * 3600) + (ctx->curr.minutes * 60) + ctx->curr.seconds;
     int32_t t1 = (ctx->prev.hours * 3600) + (ctx->prev.minutes * 60) + ctx->prev.seconds;
+#if LOCAL_DEBUG
+    printf(MESSAGE_PREFIX "t1 %d t2 %d (%d)\n", t1, t2, t2-t1);
+#endif
 
     int time_ok = 0; /* assume time is bad */
 
@@ -180,6 +196,14 @@ void obe_timecode_update(struct timecode_context_s *ctx, unsigned int hrs, unsig
         else {
             /* Not the same, not +1, not starting up, it must be an error. */
             time_ok = 0;
+#if LOCAL_DEBUG
+printf(MESSAGE_PREFIX  "time_ok %d booo tx->prev.corrected_frame %d ctx->curr.corrected_frame %d ctx->intendedFPS %d, %d, %d\n", time_ok,
+    ctx->prev.corrected_frame,
+    ctx->curr.corrected_frame,
+    ctx->prev.frame,
+    ctx->curr.frame,
+    ctx->intendedFPS);
+#endif
         }
     }
 
