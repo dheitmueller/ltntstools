@@ -67,13 +67,13 @@ void obe_timecode_clear(struct timecode_context_s *ctx, uint32_t intendedFPS)
     obe_timecode_reset(ctx);
 }
 
-static void obe_timecode_raise_discontinuity(struct timecode_context_s *ctx)
+static void obe_timecode_raise_discontinuity(struct timecode_context_s *ctx, int reason)
 {
     ctx->discontinuity = 1;
     gettimeofday(&ctx->lastDiscontinuity, NULL);
     
     time_t now = time(0);
-    printf(MESSAGE_PREFIX "timecode discontinuity detected @ %s", ctime(&now));
+    printf(MESSAGE_PREFIX "timecode discontinuity detected reason %d @ %s", reason, ctime(&now));
     printf(MESSAGE_PREFIX "timecode prev %02d:%02d:%02d.%03d (seq %08x) curr %02d:%02d:%02d.%03d (seq %08x)\n",
         ctx->prev.hours, ctx->prev.minutes, ctx->prev.seconds, ctx->prev.frame, ctx->prev.seqNr,
         ctx->curr.hours, ctx->curr.minutes, ctx->curr.seconds, ctx->curr.frame, ctx->curr.seqNr);
@@ -131,9 +131,15 @@ printf(MESSAGE_PREFIX "ctx->prev.corrected_frame %d ctx->curr.corrected_frame %d
     if (ctx->intendedFPS <= 30) {
         ctx->curr.corrected_frame = ctx->curr.frame;
     } else {
+#if LOCAL_DEBUG
+        printf("ctx->curr.frame %d ctx->prev.frame %d\n",
+            ctx->curr.frame,
+            ctx->prev.frame);
+#endif
         if (ctx->curr.frame == 0 && ctx->prev.frame != 0) {
             /* We've just wrapped */
             ctx->curr.corrected_frame = ctx->curr.frame;
+            ctx->prev.corrected_frame = ctx->intendedFPS - 1;
         } else
         if (ctx->curr.corrected_frame >= 0) {
             ctx->curr.corrected_frame++;
@@ -179,15 +185,24 @@ printf(MESSAGE_PREFIX "ctx->prev.corrected_frame %d ctx->curr.corrected_frame %d
     }
 
 #if LOCAL_DEBUG
-    printf(MESSAGE_PREFIX "prior %d, calc %d, curr %d\n",
-        ctx->prev.frame, ((ctx->prev.frame + 1) % 30), ctx->curr.frame);
+    printf(MESSAGE_PREFIX "ctx->prev.frame %d, calc %d, ctx->curr.frame %d\n",
+        ctx->prev.frame, ((ctx->prev.frame + 1) % ctx->intendedFPS), ctx->curr.frame);
 #endif
 
     if (time_ok) {
+#if LOCAL_DEBUG
+printf("PIC TIMING PRE, time_ok %d, tx->prev.corrected_frame %d ctx->curr.corrected_frame %d, ctx->prev.frame %d, ctx->curr.frame %d, ctx->intendedFPS %d\n",
+    time_ok,
+    ctx->prev.corrected_frame,
+    ctx->curr.corrected_frame,
+    ctx->prev.frame,
+    ctx->curr.frame,
+    ctx->intendedFPS);
+#endif
         if (ctx->prev.frame == ctx->curr.frame) {
             /* dup frame we allow */
         } else
-        if (((ctx->prev.corrected_frame + 1) % ctx->intendedFPS) == ctx->curr.corrected_frame) {
+        if (((ctx->prev.corrected_frame + 1) % ctx->intendedFPS) == (unsigned int)ctx->curr.corrected_frame) {
             /* next frame in sequence we allow */
         } else
         if (ctx->curr.corrected_frame == -1) {
