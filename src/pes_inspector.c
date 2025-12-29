@@ -1177,6 +1177,83 @@ static void *_avio_raw_callback_status(void *userContext, enum source_avio_statu
 	return NULL;
 }
 
+static int test_1a()
+{
+	struct ltntstools_corrected_clock_s t;
+
+	ltntstools_corrected_clock_init(&t, 90000);
+
+	/* Test case, B frames without a clock wrap */
+    /*                  f+0   f+1   f+3   f+2   f+4   f+5   f+8    f+6    f+7    f+9 */
+	int64_t pts1q[] = { 1500, 3000, 6000, 4500, 7500, 9000, 13500, 10500, 12000, 15000, -1 };
+	uint64_t pts1a[] = { 1500, 3000, 6000, 4500, 7500, 9000, 13500, 10500, 12000, 15000, -1 }; /* Answer */
+
+	int i = 0;
+	while (pts1q[i] != -1) {
+		ltntstools_corrected_clock_update(&t, pts1q[i]);
+		printf("1a. pts %13" PRId64 " corrected %13" PRId64 "\n", pts1q[i], ltntstools_corrected_clock_unwrapped(&t));
+		if (pts1a[i] != ltntstools_corrected_clock_unwrapped(&t)) {
+			printf("Test failed got %13" PRId64 " wanted %13" PRId64 "\n", ltntstools_corrected_clock_unwrapped(&t), pts1a[i]);
+			abort();
+		}
+
+		i++;
+	}
+	return 0;
+}
+
+static int test_2a()
+{
+	struct ltntstools_corrected_clock_s t;
+
+	ltntstools_corrected_clock_init(&t, 90000);
+
+	/* Test case, wrap with no B frames */
+	/*                  f+0                   f+1                   f+2                                      f+3              */
+	int64_t pts1q[] = { MAX_PTS_VALUE - 3000, MAX_PTS_VALUE - 1500, MAX_PTS_VALUE,                 1500,                     3000,     -1 };
+	uint64_t pts1a[] = { MAX_PTS_VALUE - 3000, MAX_PTS_VALUE - 1500, MAX_PTS_VALUE, MAX_PTS_VALUE + 1500 + 1, MAX_PTS_VALUE + 3000 + 1, -1 };
+
+	int i = 0;
+	while (pts1q[i] != -1) {
+		ltntstools_corrected_clock_update(&t, pts1q[i]);
+		printf("2a. pts %13" PRId64 " corrected %13" PRId64 "\n", pts1q[i], ltntstools_corrected_clock_unwrapped(&t));
+		if (pts1a[i] != ltntstools_corrected_clock_unwrapped(&t)) {
+			printf("Test failed got %13" PRId64 " wanted %13" PRId64 "\n", ltntstools_corrected_clock_unwrapped(&t), pts1a[i]);
+			abort();
+		}
+		i++;
+	}
+	return 0;
+}
+
+static int test_3a()
+{
+	struct ltntstools_corrected_clock_s t;
+
+	ltntstools_corrected_clock_init(&t, 90000);
+
+	int64_t b = 8589925910;
+	int64_t d = 1800;
+
+	/* Encoder running for 55 seconds, massive stream switch to backup encoder, clock jumps forward into a general wrap WITH B frames
+	 * Intervals of 1800 (50fps) intensionally different to 1500 (60fps)
+	 *                  f+0  (rst)  f+0          f+1          f+2          f+5                      f+3         f+4         f+6                       f+7                       f+8  */
+	int64_t pts1q[] = { 90000 * 55, b + (0 * d), b + (1 * d), b + (2 * d),                 318,     8589931310, 8589933110,                 2118,                     3918,                     5718,     -1 };
+	uint64_t pts1a[] = { 90000 * 55, b + (0 * d), b + (1 * d), b + (2 * d), MAX_PTS_VALUE + 318 + 1, 8589931310, 8589933110, MAX_PTS_VALUE + 2118 + 1, MAX_PTS_VALUE + 3918 + 1, MAX_PTS_VALUE + 5718 + 1, -1 };
+
+	int i = 0;
+	while (pts1q[i] != -1) {
+		ltntstools_corrected_clock_update(&t, pts1q[i]);
+		printf("3a. pts %13" PRId64 " corrected %13" PRId64 "\n", pts1q[i], ltntstools_corrected_clock_unwrapped(&t));
+		if (pts1a[i] != ltntstools_corrected_clock_unwrapped(&t)) {
+			printf("Test failed got %13" PRId64 " wanted %13" PRId64 "\n", ltntstools_corrected_clock_unwrapped(&t), pts1a[i]);
+			abort();
+		}
+		i++;
+	}
+	return 0;
+}
+
 static void usage(const char *progname)
 {
 	printf("\nA tool to extract and display PES packets from transport files or streams.\n");
@@ -1232,6 +1309,15 @@ int pes_inspector(int argc, char *argv[])
 		switch (ch) {
 		case '@':
 			ctx->testcase_validate = atoi(optarg);
+			if (ctx->testcase_validate == 315) {
+				printf("---\n");
+				test_1a();
+				printf("---\n");
+				test_2a();
+				printf("---\n");
+				test_3a();
+				return 0;
+			}
 			break;
 		case '?':
 		case 'h':
