@@ -163,7 +163,7 @@ static void decode(struct ltntstools_audioanalyzer_ctx_s *ctx, struct ltntstools
     int ret = avcodec_send_packet(stream->codecContext, stream->pkt);
     if (ret < 0) {
         fprintf(stderr, "Error submitting the packet to the decoder\n");
-        exit(1);
+        return;
     }
 
     /* read all the output frames (in general there may be any number of them */
