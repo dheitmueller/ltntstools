@@ -458,6 +458,11 @@ ssize_t ltntstools_audioanalyzer_write(void *hdl, const uint8_t *pkts, unsigned 
          * feed a fifo and return quickly. The thread will take care of the rest.
          */
         pthread_mutex_lock(&stream->tsmutex);
+        while (av_fifo_space(stream->tsfifo) < TS_BUF_MAX_SIZE) {
+            pthread_mutex_unlock(&stream->tsmutex);
+            usleep(1000);
+            pthread_mutex_lock(&stream->tsmutex);
+	}
         av_fifo_generic_write(stream->tsfifo, (void *)pkt, 188, NULL);
         pthread_mutex_unlock(&stream->tsmutex);
         count++;
