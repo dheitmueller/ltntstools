@@ -1025,13 +1025,17 @@ int sei_latency_inspector(int argc, char *argv[])
 		stop_source(ctx, 2);
 	}
 
+	/* Both inputs are stopped, so the caches are stable, but they must still exist
+	 * because the summary counts unmatched frames from them.
+	 */
+	print_summary(ctx);
+
 	destroy_source(ctx, 1);
 
 	if (ctx->compareMode) {
 		destroy_source(ctx, 2);
 	}
 
-	print_summary(ctx);
 	free(ctx->samples);
 
 	if (ctx->udpOutput) {
