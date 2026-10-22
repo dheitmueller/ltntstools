@@ -53,6 +53,8 @@ struct timing_element_s
 
 	uint32_t sei_framenumber;
 	int valid; /* Element holds a frame, as opposed to never having been used */
+	int counted; /* Frame was offered for comparison (after warm up) */
+	int matched; /* Frame has been matched with the other stream at least once */
 
 	struct timeval ts_seen; /* Timestamp from walltime when we saw this frame from the network */
 
@@ -116,8 +118,9 @@ struct tool_ctx_s
 	int rawMode; /* Report arrival time delta, not corrected for PTS burstiness */
 
 	/* Compare mode results, one sample per frame matched between the streams */
-	uint64_t matched;
+	uint64_t matched; /* Matched pairs. A frame number can repeat (frame rate conversion), so this can exceed distinct frames */
 	uint64_t seen[MAX_STREAM_SOURCES]; /* Frames seen per stream after warm up */
+	uint64_t distinct[MAX_STREAM_SOURCES]; /* Distinct frames per stream that matched at least once */
 	int32_t *samples;
 	size_t nsamples;
 	size_t capsamples;
@@ -182,14 +185,55 @@ static int cmp_int32(const void *a, const void *b)
 	return (x > y) - (x < y);
 }
 
+/* Frames in the stream's cache that never matched, between the first and last frame that did.
+ * Frames before the first match have a partner from before the warm up, and frames after the
+ * last match may simply still be in flight through the system under test, so neither is a loss.
+ */
+static uint64_t count_unmatched(struct stream_s *stream)
+{
+	struct timing_element_s *e = NULL;
+	struct timeval first = { 0, 0 }, last = { 0, 0 };
+	int haveMatch = 0;
+	uint64_t unmatched = 0;
+
+	pthread_mutex_lock(&stream->lockElements);
+
+	xorg_list_for_each_entry(e, &stream->listElements, list) {
+		if (!e->valid || !e->counted || !e->matched)
+			continue;
+		if (!haveMatch || ltn_timeval_subtract_us(&e->ts_seen, &first) < 0)
+			first = e->ts_seen;
+		if (!haveMatch || ltn_timeval_subtract_us(&e->ts_seen, &last) > 0)
+			last = e->ts_seen;
+		haveMatch = 1;
+	}
+
+	if (haveMatch) {
+		xorg_list_for_each_entry(e, &stream->listElements, list) {
+			if (!e->valid || !e->counted || e->matched)
+				continue;
+			if (ltn_timeval_subtract_us(&e->ts_seen, &first) > 0 && ltn_timeval_subtract_us(&e->ts_seen, &last) < 0)
+				unmatched++;
+		}
+	}
+
+	pthread_mutex_unlock(&stream->lockElements);
+	return unmatched;
+}
+
 static void print_summary(struct tool_ctx_s *ctx)
 {
 	if (!ctx->compareMode)
 		return;
 
-	printf("\nSummary (%s latency): matched %" PRIu64 " frames, only in stream 1: %" PRIu64 ", only in stream 2: %" PRIu64 "\n",
-		ctx->rawMode ? "raw arrival" : "PTS corrected", ctx->matched,
-		ctx->seen[0] - ctx->matched, ctx->seen[1] - ctx->matched);
+	printf("\nSummary (%s latency): matched %" PRIu64 " frame pairs\n",
+		ctx->rawMode ? "raw arrival" : "PTS corrected", ctx->matched);
+	for (int i = 0; i < 2; i++) {
+		printf("  stream %d: seen %" PRIu64 ", distinct matched %" PRIu64 ", unmatched %" PRIu64 "\n",
+			i + 1, ctx->seen[i], ctx->distinct[i], count_unmatched(&ctx->src[i]));
+	}
+	printf("  (unmatched counts the span between a stream's first and last match, within the %d frame cache)\n",
+		ctx->totalElements);
 	if (ctx->nsamples) {
 		qsort(ctx->samples, ctx->nsamples, sizeof(*ctx->samples), cmp_int32);
 		printf("  min %d ms, p50 %d ms, p95 %d ms, max %d ms\n",
@@ -219,7 +263,7 @@ void _printList(struct tool_ctx_s *ctx, struct stream_s *stream)
 /* Search the elements in stream for the frame number in element. The list is
  * in arrival order, so the newest frames are at the tail.
  */
-static void _compareStreams(struct tool_ctx_s *ctx, struct stream_s *stream, struct timing_element_s *element, int elementStreamNr)
+static int _compareStreams(struct tool_ctx_s *ctx, struct stream_s *stream, struct timing_element_s *element, int elementStreamNr)
 {
 	struct timing_element_s *e = NULL;
 
@@ -238,7 +282,7 @@ static void _compareStreams(struct tool_ctx_s *ctx, struct stream_s *stream, str
 		int cmp = ltn_timeval_subtract_us(&element->ts_seen, &e->ts_seen);
 		if (cmp < 0 || (cmp == 0 && elementStreamNr == 1)) {
 			pthread_mutex_unlock(&stream->lockElements);
-			return;
+			return 0;
 		}
 
 		/* Always report stream 2 relative to stream 1, whichever stream saw the frame last */
@@ -266,6 +310,12 @@ static void _compareStreams(struct tool_ctx_s *ctx, struct stream_s *stream, str
 
 		pthread_mutex_lock(&ctx->console_mutex);
 		ctx->matched++;
+		/* The arriving frame is new, so it counts once. The cached frame counts only on its first match. */
+		ctx->distinct[elementStreamNr - 1]++;
+		if (!e->matched) {
+			e->matched = 1;
+			ctx->distinct[stream->nr - 1]++;
+		}
 		record_sample(ctx, finalLatency_ms);
 
 		char *t1, *t2;
@@ -304,10 +354,11 @@ static void _compareStreams(struct tool_ctx_s *ctx, struct stream_s *stream, str
 
 		pthread_mutex_unlock(&ctx->console_mutex);
 		pthread_mutex_unlock(&stream->lockElements);
-		return;
+		return 1;
 	}
 
 	pthread_mutex_unlock(&stream->lockElements);
+	return 0;
 }
 
 static void _maintain_clocks(struct stream_s *stream, struct ltn_pes_packet_s *pes, int64_t *trueLatency_ms)
@@ -432,6 +483,8 @@ static void *pe_callback(void *userContext, struct ltn_pes_packet_s *pes)
 	e->trueLatency = trueLatency_ms;
 	e->sei_framenumber = framenumber;
 	e->valid = 1;
+	e->counted = 0;
+	e->matched = 0;
 	e->PTS = pes->PTS;
 	e->DTS = pes->DTS;
 #if 0
@@ -479,6 +532,7 @@ static void *pe_callback(void *userContext, struct ltn_pes_packet_s *pes)
 			pthread_mutex_lock(&ctx->console_mutex);
 			ctx->seen[stream->nr - 1]++;
 			pthread_mutex_unlock(&ctx->console_mutex);
+			e->counted = 1;
 
 			snapshot = *e;
 			doCompare = 1;
@@ -525,8 +579,11 @@ static void *pe_callback(void *userContext, struct ltn_pes_packet_s *pes)
 	pthread_mutex_unlock(&stream->lockElements);
 
 	/* Our own lock is released first, the two streams never hold each other's lock together */
-	if (doCompare) {
-		_compareStreams(ctx, &ctx->src[(stream->nr == 1) ? 1 : 0], &snapshot, stream->nr);
+	if (doCompare && _compareStreams(ctx, &ctx->src[(stream->nr == 1) ? 1 : 0], &snapshot, stream->nr)) {
+		/* Only this thread recycles elements of its own stream, so e is still the frame we compared */
+		pthread_mutex_lock(&stream->lockElements);
+		e->matched = 1;
+		pthread_mutex_unlock(&stream->lockElements);
 	}
 
 	ltn_pes_packet_free(pes);
