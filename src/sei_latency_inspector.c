@@ -34,6 +34,15 @@
 #define DEFAULT_ELEMENTS (60 * 120)
 #define DEFAULT_INSTANCE_NAME "INSTANCE_NAME"
 
+/* The PTS of a frame minus the walltime the encoder captured it at moves slowly, by clock drift and
+ * the odd repeated frame. A step bigger than this between a frame and the recent average is not latency,
+ * it is the encoder or an upstream device restarting or re-timing its timestamps.
+ */
+#define PTS_DISCONTINUITY_THRESHOLD_MS 1000
+
+/* How many frames the running average of PTS minus capture time spans. */
+#define PTS_MINUS_CAPTURE_AVERAGE_FRAMES 32
+
 static int g_running = 1;
 
 struct tool_ctx_s;
@@ -99,6 +108,10 @@ struct stream_s {
 	int64_t driftPTS_ms;
 	int64_t driftDTS_ms;
 	int64_t drift_ms;
+
+	/* Running average of PTS minus the encoder capture time, in ticks mod 2^33, see _check_discontinuity() */
+	int64_t ptsMinusCaptureAvg;
+	int havePtsMinusCapture;
 
 #define MODE_SOURCE_AVIO 0
 #define MODE_SOURCE_PCAP 1
@@ -247,10 +260,64 @@ static int _compareStreams(struct tool_ctx_s *ctx, struct stream_s *stream, stru
 	return 0;
 }
 
+/* Wrap v into half the PTS range either side of zero. */
+static int64_t _pts33_signed(int64_t v)
+{
+	const int64_t range = (int64_t)MAX_PTS_VALUE + 1; /* MAX_PTS_VALUE is the largest value, not the number of values */
+
+	v %= range;
+	if (v < 0)
+		v += range;
+	if (v >= (range >> 1))
+		v -= range;
+	return v;
+}
+
+/* The clocks compare PTS against walltime, so when a stream's PTS restarts, steps or is retimed they take
+ * the step for a change in latency and keep it, by up to hours, until the inspector is restarted.
+ *
+ * The SEI carries the walltime the encoder captured each frame at. PTS minus that capture time is steady,
+ * whatever the arrival jitter and the frame reordering, and a wrap does not change it. When a frame is more
+ * than PTS_DISCONTINUITY_THRESHOLD_MS from its running average, tell the clocks, which then rebase on it.
+ */
+static void _check_discontinuity(struct stream_s *stream, struct ltn_pes_packet_s *pes)
+{
+	struct timeval now;
+	gettimeofday(&now, NULL);
+
+	/* The probe has just measured latency from the encoder's capture time to now. */
+	int64_t latency_ms = ltntstools_probe_ltnencoder_get_total_latency(stream->probe_hdl);
+	int64_t capture_ms = (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000 - latency_ms;
+
+	int64_t ticksPerMs = stream->clkPTS.ticks_per_second / 1000;
+	int64_t ptsMinusCapture = _pts33_signed(pes->PTS - capture_ms * ticksPerMs);
+
+	if (!stream->havePtsMinusCapture) {
+		stream->ptsMinusCaptureAvg = ptsMinusCapture;
+		stream->havePtsMinusCapture = 1;
+		return;
+	}
+
+	int64_t step = _pts33_signed(ptsMinusCapture - stream->ptsMinusCaptureAvg);
+	if (step > PTS_DISCONTINUITY_THRESHOLD_MS * ticksPerMs ||
+		step < -PTS_DISCONTINUITY_THRESHOLD_MS * ticksPerMs) {
+		printf("Stream %d: timestamp discontinuity, PTS %" PRIi64 " is %" PRIi64 " ms from where the capture time puts it, rebasing the clocks\n",
+			stream->nr, pes->PTS, step / ticksPerMs);
+		ltntstools_clock_mark_discontinuity(&stream->clkPTS);
+		ltntstools_clock_mark_discontinuity(&stream->clkDTS);
+		stream->ptsMinusCaptureAvg = ptsMinusCapture;
+		return;
+	}
+
+	stream->ptsMinusCaptureAvg = _pts33_signed(stream->ptsMinusCaptureAvg + step / PTS_MINUS_CAPTURE_AVERAGE_FRAMES);
+}
+
 static void _maintain_clocks(struct stream_s *stream, struct ltn_pes_packet_s *pes, int64_t *trueLatency_ms)
 {
 	struct tool_ctx_s *ctx = stream->ctx;
 	*trueLatency_ms = -1;
+
+	_check_discontinuity(stream, pes);
 
 	/* Establish PTS vs walltime if needed, ideally on an iframe - pick a large pes to do this on. */
 	if (ltntstools_clock_is_established_wallclock(&stream->clkPTS) == 0) {
