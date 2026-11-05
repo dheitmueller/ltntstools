@@ -128,6 +128,18 @@ struct tool_ctx_s
 	int compareMode;
 	int rawMode; /* Report arrival time delta, not corrected for PTS burstiness */
 
+	/* -W: report a low percentile of the arrival time delta over a sliding window of time, so that
+	 * jitter is filtered out and a lasting change in latency is followed. No PTS clock is involved.
+	 */
+	int filterWindowMs;
+	int filterPercentile; /* 0 is the minimum */
+#define FILTER_MAX_SAMPLES 8192
+	struct filter_sample_s {
+		int64_t atMs;
+		int64_t deltaMs;
+	} filterRing[FILTER_MAX_SAMPLES];
+	int filterHead, filterCount;
+
 	char *instanceName;
 
 	pthread_mutex_t console_mutex;
@@ -159,6 +171,45 @@ void _printList(struct tool_ctx_s *ctx, struct stream_s *stream)
 		if (i++ > 10)
 			break;
 	}
+}
+
+static int _cmp_int64(const void *a, const void *b)
+{
+	int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+	return (x > y) - (x < y);
+}
+
+/* Add the arrival time delta of a matched frame to the sliding window, and return the configured
+ * percentile of the deltas that fall inside it. Called with ctx->console_mutex held.
+ */
+static int64_t _filter_latency(struct tool_ctx_s *ctx, int64_t deltaMs)
+{
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	int64_t nowMs = (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000;
+
+	int tail = (ctx->filterHead + ctx->filterCount) % FILTER_MAX_SAMPLES;
+	ctx->filterRing[tail].atMs = nowMs;
+	ctx->filterRing[tail].deltaMs = deltaMs;
+	if (ctx->filterCount < FILTER_MAX_SAMPLES) {
+		ctx->filterCount++;
+	} else {
+		ctx->filterHead = (ctx->filterHead + 1) % FILTER_MAX_SAMPLES;
+	}
+
+	while (ctx->filterCount > 1 && ctx->filterRing[ctx->filterHead].atMs < nowMs - ctx->filterWindowMs) {
+		ctx->filterHead = (ctx->filterHead + 1) % FILTER_MAX_SAMPLES;
+		ctx->filterCount--;
+	}
+
+	static int64_t sorted[FILTER_MAX_SAMPLES];
+	for (int i = 0; i < ctx->filterCount; i++) {
+		sorted[i] = ctx->filterRing[(ctx->filterHead + i) % FILTER_MAX_SAMPLES].deltaMs;
+	}
+	qsort(sorted, ctx->filterCount, sizeof(sorted[0]), _cmp_int64);
+
+	int idx = (int)(((int64_t)(ctx->filterCount - 1) * ctx->filterPercentile) / 100);
+	return sorted[idx];
 }
 
 /* Search the elements in stream for the frame number in element. The list is
@@ -216,6 +267,10 @@ static int _compareStreams(struct tool_ctx_s *ctx, struct stream_s *stream, stru
 			int64_t finalLatency_ms = ctx->rawMode ? ms : b->trueLatency - a->trueLatency;
 
 			pthread_mutex_lock(&ctx->console_mutex);
+
+			if (ctx->filterWindowMs > 0) {
+				finalLatency_ms = _filter_latency(ctx, ms);
+			}
 
 			char *t1, *t2;
 			ISO8601_UTC_CreateTimestamp(&a->ts_seen, &t1);
@@ -691,6 +746,9 @@ static void usage(const char *progname)
                "             192.168.20.45 is the IP addr where we'll issue a IGMP join\n");
 	printf("  -I <url#2> Eg: rtp|udp://227.1.20.45:4001?localaddr=192.168.20.45\n"
                "             192.168.20.45 is the IP addr where we'll issue a IGMP join\n");
+	printf("  -W <seconds> Report a low percentile of the raw arrival time difference over a sliding window of this\n"
+               "     length, instead of the PTS corrected latency. Filters jitter and follows lasting changes [def: disabled]\n");
+	printf("  -Q <percentile> The percentile -W reports, 0 is the minimum [def: 0]\n");
 	printf("  -R Compare mode: report the raw arrival time difference between the two streams\n"
                "     for each matched frame, instead of the PTS corrected latency [def: disabled]\n");
 	printf("  -v Increase level of verbosity.\n");
@@ -836,7 +894,7 @@ int sei_latency_inspector(int argc, char *argv[])
 	struct stream_s *dst = &ctx->src[1];
 
 	int ch, ret;
-	while ((ch = getopt(argc, argv, "?hvRi:f:F:I:n:N:p:P:s:S:U:")) != -1) {
+	while ((ch = getopt(argc, argv, "?hvRW:Q:i:f:F:I:n:N:p:P:s:S:U:")) != -1) {
 		switch (ch) {
 		case '?':
 		case 'h':
@@ -899,6 +957,16 @@ int sei_latency_inspector(int argc, char *argv[])
 			break;
 		case 'R':
 			ctx->rawMode = 1;
+			break;
+		case 'W':
+			ctx->filterWindowMs = (int)(atof(optarg) * 1000.0);
+			break;
+		case 'Q':
+			ctx->filterPercentile = atoi(optarg);
+			if (ctx->filterPercentile < 0 || ctx->filterPercentile > 100) {
+				fprintf(stderr, "-Q must be 0 to 100\n");
+				exit(1);
+			}
 			break;
 		case 'v':
 			ctx->verbose++;
