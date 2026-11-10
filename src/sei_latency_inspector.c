@@ -34,6 +34,10 @@
 #define DEFAULT_ELEMENTS (60 * 120)
 #define DEFAULT_INSTANCE_NAME "INSTANCE_NAME"
 
+/* The latency window and percentile, see -W and -Q. */
+#define DEFAULT_WINDOW_SECONDS 0.5
+#define DEFAULT_PERCENTILE 10
+
 /* The PTS of a frame minus the walltime the encoder captured it at moves slowly, by clock drift and
  * the odd repeated frame. A step bigger than this between a frame and the recent average is not latency,
  * it is the encoder or an upstream device restarting or re-timing its timestamps.
@@ -66,6 +70,7 @@ struct timing_element_s
 	struct timeval ts_seen; /* Timestamp from walltime when we saw this frame from the network */
 
 	int64_t trueLatency;
+	int64_t arrivalLatencyMs; /* Arrival walltime minus the encoder's capture walltime, for -W */
 };
 
 #define MAX_STREAM_SOURCES 2
@@ -128,6 +133,23 @@ struct tool_ctx_s
 	int compareMode;
 	int rawMode; /* Report arrival time delta, not corrected for PTS burstiness */
 
+	/* -W: report the difference of the low percentiles of each stream's arrival latency (arrival walltime minus the
+	 * encoder's capture walltime) over a sliding window of time. Jitter only ever adds delay to a stream, so each
+	 * stream's low percentile is its base latency whatever the other stream does. No PTS clock is involved.
+	 * A window of 0 selects the older PTS corrected latency.
+	 */
+	int filterWindowMs;
+	int filterPercentile; /* 0 is the minimum */
+#define FILTER_MAX_SAMPLES 8192
+	struct filter_ring_s {
+		struct filter_sample_s {
+			int64_t atMs;
+			int64_t valueMs;
+		} s[FILTER_MAX_SAMPLES];
+		int head, count;
+	} filterRing[MAX_STREAM_SOURCES];
+	pthread_mutex_t filterMutex;
+
 	char *instanceName;
 
 	pthread_mutex_t console_mutex;
@@ -159,6 +181,71 @@ void _printList(struct tool_ctx_s *ctx, struct stream_s *stream)
 		if (i++ > 10)
 			break;
 	}
+}
+
+static int _cmp_int64(const void *a, const void *b)
+{
+	int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+	return (x > y) - (x < y);
+}
+
+static void _filter_evict(struct tool_ctx_s *ctx, struct filter_ring_s *ring, int64_t nowMs)
+{
+	while (ring->count > 0 && ring->s[ring->head].atMs < nowMs - ctx->filterWindowMs) {
+		ring->head = (ring->head + 1) % FILTER_MAX_SAMPLES;
+		ring->count--;
+	}
+}
+
+/* Add the arrival latency of a frame to its stream's sliding window. */
+static void _filter_push(struct tool_ctx_s *ctx, int streamIdx, int64_t valueMs)
+{
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	int64_t nowMs = (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000;
+
+	pthread_mutex_lock(&ctx->filterMutex);
+	struct filter_ring_s *ring = &ctx->filterRing[streamIdx];
+	int tail = (ring->head + ring->count) % FILTER_MAX_SAMPLES;
+	ring->s[tail].atMs = nowMs;
+	ring->s[tail].valueMs = valueMs;
+	if (ring->count < FILTER_MAX_SAMPLES) {
+		ring->count++;
+	} else {
+		ring->head = (ring->head + 1) % FILTER_MAX_SAMPLES;
+	}
+	_filter_evict(ctx, ring, nowMs);
+	pthread_mutex_unlock(&ctx->filterMutex);
+}
+
+/* The configured percentile of the arrival latencies in a stream's window. Returns -1 if the window is empty. */
+static int _filter_floor(struct tool_ctx_s *ctx, int streamIdx, int64_t nowMs, int64_t *floorMs)
+{
+	static __thread int64_t sorted[FILTER_MAX_SAMPLES];
+
+	pthread_mutex_lock(&ctx->filterMutex);
+	struct filter_ring_s *ring = &ctx->filterRing[streamIdx];
+	_filter_evict(ctx, ring, nowMs);
+	int count = ring->count;
+	for (int i = 0; i < count; i++) {
+		sorted[i] = ring->s[(ring->head + i) % FILTER_MAX_SAMPLES].valueMs;
+	}
+	pthread_mutex_unlock(&ctx->filterMutex);
+
+	if (count == 0)
+		return -1;
+
+	qsort(sorted, count, sizeof(sorted[0]), _cmp_int64);
+	*floorMs = sorted[(int)(((int64_t)(count - 1) * ctx->filterPercentile) / 100)];
+	return 0;
+}
+
+/* The windowed latency is in use unless -W 0 selects the PTS corrected latency, or -R the raw arrival time delta. It
+ * uses neither the PTS nor the PTS clocks.
+ */
+static int _window_active(struct tool_ctx_s *ctx)
+{
+	return ctx->filterWindowMs > 0 && !ctx->rawMode;
 }
 
 /* Search the elements in stream for the frame number in element. The list is
@@ -202,8 +289,8 @@ static int _compareStreams(struct tool_ctx_s *ctx, struct stream_s *stream, stru
 					a->DTS,
 					b->PTS,
 					b->DTS,
-					b->trueLatency,
-					a->trueLatency);
+					_window_active(ctx) ? b->arrivalLatencyMs : b->trueLatency,
+					_window_active(ctx) ? a->arrivalLatencyMs : a->trueLatency);
 			}
 
 			char *msg = malloc(512);
@@ -216,6 +303,22 @@ static int _compareStreams(struct tool_ctx_s *ctx, struct stream_s *stream, stru
 			int64_t finalLatency_ms = ctx->rawMode ? ms : b->trueLatency - a->trueLatency;
 
 			pthread_mutex_lock(&ctx->console_mutex);
+
+			if (_window_active(ctx)) {
+				struct timeval nowTv;
+				gettimeofday(&nowTv, NULL);
+				int64_t nowMs = (int64_t)nowTv.tv_sec * 1000 + nowTv.tv_usec / 1000;
+				int64_t floorA, floorB;
+
+				/* a is from the first stream and b from the second. A window that has emptied, because the
+				 * stream stopped for longer than the window, falls back to the frame being compared.
+				 */
+				if (_filter_floor(ctx, 0, nowMs, &floorA) != 0)
+					floorA = a->arrivalLatencyMs;
+				if (_filter_floor(ctx, 1, nowMs, &floorB) != 0)
+					floorB = b->arrivalLatencyMs;
+				finalLatency_ms = floorB - floorA;
+			}
 
 			char *t1, *t2;
 			ISO8601_UTC_CreateTimestamp(&a->ts_seen, &t1);
@@ -419,9 +522,15 @@ static void *pe_callback(void *userContext, struct ltn_pes_packet_s *pes)
 		return NULL;
 	}
 
-	/* Establish walltimes vs PTS,s and keep them current. */
-	int64_t trueLatency_ms;
-	_maintain_clocks(stream, pes, &trueLatency_ms);
+	int64_t arrivalLatencyMs = ltntstools_probe_ltnencoder_get_total_latency(stream->probe_hdl);
+
+	int64_t trueLatency_ms = -1;
+	if (_window_active(stream->ctx)) {
+		_filter_push(stream->ctx, stream->nr - 1, arrivalLatencyMs);
+	} else {
+		/* Establish walltimes vs PTS,s and keep them current. */
+		_maintain_clocks(stream, pes, &trueLatency_ms);
+	}
 
 	/* -------- */
 	/* Found the timing data, extract throw the details on a list */
@@ -434,6 +543,7 @@ static void *pe_callback(void *userContext, struct ltn_pes_packet_s *pes)
 	}
 
 	e->trueLatency = trueLatency_ms;
+	e->arrivalLatencyMs = arrivalLatencyMs;
 	e->sei_framenumber = framenumber;
 	e->valid = 1;
 	e->PTS = pes->PTS;
@@ -691,8 +801,15 @@ static void usage(const char *progname)
                "             192.168.20.45 is the IP addr where we'll issue a IGMP join\n");
 	printf("  -I <url#2> Eg: rtp|udp://227.1.20.45:4001?localaddr=192.168.20.45\n"
                "             192.168.20.45 is the IP addr where we'll issue a IGMP join\n");
+	printf("  -W <seconds> Report the latency as the difference of a low percentile of each stream's arrival latency\n"
+               "     (arrival walltime minus the encoder's SEI capture walltime) over a sliding window of this length.\n"
+               "     Jitter only adds delay, so the low percentile is the stream's base latency; a lasting change in\n"
+               "     latency moves it within about the window. 0 selects the older PTS corrected latency, which cannot\n"
+               "     follow a change that leaves the PTS alone [def: %g]\n",
+               DEFAULT_WINDOW_SECONDS);
+	printf("  -Q <percentile> The percentile -W reports, 0 is the minimum [def: %d]\n", DEFAULT_PERCENTILE);
 	printf("  -R Compare mode: report the raw arrival time difference between the two streams\n"
-               "     for each matched frame, instead of the PTS corrected latency [def: disabled]\n");
+               "     for each matched frame, instead of the windowed or PTS corrected latency [def: disabled]\n");
 	printf("  -v Increase level of verbosity.\n");
 	printf("  -h Display command line help.\n");
 	printf("  -n <instancename> [def: %s]\n", DEFAULT_INSTANCE_NAME);
@@ -824,10 +941,13 @@ int sei_latency_inspector(int argc, char *argv[])
 	ctx = &myctx;
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->totalElements = DEFAULT_ELEMENTS;
+	ctx->filterWindowMs = (int)(DEFAULT_WINDOW_SECONDS * 1000.0);
+	ctx->filterPercentile = DEFAULT_PERCENTILE;
 	ctx->compareMode = 0;
 	ctx->instanceName = strdup(DEFAULT_INSTANCE_NAME);
 
 	pthread_mutex_init(&ctx->console_mutex, NULL);
+	pthread_mutex_init(&ctx->filterMutex, NULL);
 
 	init_source(ctx, 1);
 	init_source(ctx, 2);
@@ -836,7 +956,7 @@ int sei_latency_inspector(int argc, char *argv[])
 	struct stream_s *dst = &ctx->src[1];
 
 	int ch, ret;
-	while ((ch = getopt(argc, argv, "?hvRi:f:F:I:n:N:p:P:s:S:U:")) != -1) {
+	while ((ch = getopt(argc, argv, "?hvRW:Q:i:f:F:I:n:N:p:P:s:S:U:")) != -1) {
 		switch (ch) {
 		case '?':
 		case 'h':
@@ -899,6 +1019,16 @@ int sei_latency_inspector(int argc, char *argv[])
 			break;
 		case 'R':
 			ctx->rawMode = 1;
+			break;
+		case 'W':
+			ctx->filterWindowMs = (int)(atof(optarg) * 1000.0);
+			break;
+		case 'Q':
+			ctx->filterPercentile = atoi(optarg);
+			if (ctx->filterPercentile < 0 || ctx->filterPercentile > 100) {
+				fprintf(stderr, "-Q must be 0 to 100\n");
+				exit(1);
+			}
 			break;
 		case 'v':
 			ctx->verbose++;
